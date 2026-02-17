@@ -328,8 +328,3 @@ cockroachdb-best-practices-demo/
 - [cockroachdb-jdbc-wrapper](https://github.com/viragtripathi/cockroachdb-jdbc-wrapper) -- the retry library used by these demos
 - [cockroachdb-jdbc-wrapper-demo](https://github.com/viragtripathi/cockroachdb-jdbc-wrapper-demo) -- a simpler "hello world" demo of the wrapper library
 
----
-
-## License
-
-MIT
