@@ -1,0 +1,50 @@
+name: Java CI with CockroachDB
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Start CockroachDB container
+        run: |
+          docker run -d \
+            --name crdb \
+            -p 26257:26257 \
+            cockroachdb/cockroach:latest start-single-node --insecure
+
+      - name: Wait for CockroachDB to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec crdb /cockroach/cockroach sql --insecure -e "SELECT 1" > /dev/null 2>&1; then
+              echo "CockroachDB is ready"
+              break
+            fi
+            echo "Waiting for CockroachDB... ($i/30)"
+            sleep 2
+          done
+
+      - name: Install cockroachdb-jdbc-wrapper
+        run: |
+          git clone https://github.com/viragtripathi/cockroachdb-jdbc-wrapper.git /tmp/wrapper
+          cd /tmp/wrapper
+          ./mvnw install -DskipTests -q
+
+      - name: Build and Test
+        run: ./mvnw clean verify

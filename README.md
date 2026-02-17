@@ -56,7 +56,7 @@ The table below maps every major CockroachDB best practice to the demo that cove
 ## Prerequisites
 
 - **Java 21+** (JDK)
-- **Maven 3.9+**
+- **Maven 3.9+** (or use the included `./mvnw` wrapper)
 - **CockroachDB** -- one of:
   - Docker (for local single-node)
   - CockroachDB Cloud cluster (Standard or Dedicated)
@@ -70,7 +70,7 @@ The table below maps every major CockroachDB best practice to the demo that cove
 
 ```bash
 docker-compose up -d
-mvn compile exec:java
+./mvnw compile exec:java
 ```
 
 This starts a single-node insecure CockroachDB at `localhost:26257`. Good for Demos 1-9. Demo 10 (Multi-Region) will run in informational mode since there's only one region.
@@ -92,7 +92,7 @@ cd cockroach-mr-cluster && chmod +x *.sh && ./run-insecure.sh
 
 # Run demos (HAProxy on localhost:26257)
 cd /path/to/cockroachdb-best-practices-demo
-mvn compile exec:java
+./mvnw compile exec:java
 ```
 
 **Secure (TLS + password auth, production-like):**
@@ -111,7 +111,7 @@ cd /path/to/cockroachdb-best-practices-demo
 export COCKROACH_URL="jdbc:postgresql://localhost:26257/defaultdb?sslmode=require&sslrootcert=/path/to/cockroach-mr-secure/certs/ca.crt"
 export COCKROACH_USER="craig"
 export COCKROACH_PASSWORD="cockroach"
-mvn compile exec:java
+./mvnw compile exec:java
 ```
 
 Both setups provide:
@@ -135,13 +135,13 @@ export COCKROACH_URL="jdbc:postgresql://<host>:26257/defaultdb?sslmode=verify-fu
 export COCKROACH_USER="<username>"
 export COCKROACH_PASSWORD="<password>"
 
-mvn compile exec:java
+./mvnw compile exec:java
 ```
 
 Or pass connection details as command-line arguments:
 
 ```bash
-mvn compile exec:java -Dexec.args="all \
+./mvnw compile exec:java -Dexec.args="all \
   --url 'jdbc:postgresql://<host>:26257/defaultdb?sslmode=verify-full' \
   --user <username> \
   --password <password>"
@@ -154,7 +154,7 @@ export COCKROACH_URL="jdbc:postgresql://<host>:26257/defaultdb?sslmode=verify-fu
 export COCKROACH_USER="<username>"
 export COCKROACH_PASSWORD="<password>"
 
-mvn compile exec:java
+./mvnw compile exec:java
 ```
 
 To enable multi-region on CockroachDB Cloud (required for Demo 10 full functionality):
@@ -186,23 +186,23 @@ cd /path/to/cockroachdb-jdbc-wrapper
 
 ```bash
 # Interactive menu
-mvn compile exec:java
+./mvnw compile exec:java
 
 # Run a specific demo
-mvn compile exec:java -Dexec.args="7"
+./mvnw compile exec:java -Dexec.args="7"
 
 # Run all demos
-mvn compile exec:java -Dexec.args="all"
+./mvnw compile exec:java -Dexec.args="all"
 ```
 
 ### Run Tests
 
 ```bash
 # Against local CockroachDB
-mvn test
+./mvnw test
 
 # Against CockroachDB Cloud
-COCKROACH_URL="jdbc:postgresql://..." COCKROACH_USER="..." COCKROACH_PASSWORD="..." mvn test
+COCKROACH_URL="jdbc:postgresql://..." COCKROACH_USER="..." COCKROACH_PASSWORD="..." ./mvnw test
 ```
 
 ---
