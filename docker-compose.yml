@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  cockroach:
+    image: cockroachdb/cockroach:latest
+    command: start-single-node --insecure
+    container_name: cockroach-best-practices
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+
+volumes:
+  cockroach-data:
+    name: cockroach-best-practices-data
