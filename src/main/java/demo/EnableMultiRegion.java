@@ -63,7 +63,7 @@ public class EnableMultiRegion {
             }
 
             // Set primary region (first one)
-            String primary = regions.get(0);
+            String primary = regions.getFirst();
             System.out.println("Setting primary region: " + primary);
             stmt.execute("ALTER DATABASE defaultdb PRIMARY REGION \"" + primary + "\"");
             System.out.println("  Done.");

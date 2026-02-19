@@ -114,6 +114,73 @@ public class DemoRunner {
         for (String demo : new String[]{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}) {
             runDemo(ds, demo);
         }
+        printBadSqlPatterns();
         DemoUtils.banner("ALL DEMOS COMPLETE");
+    }
+
+    static void printBadSqlPatterns() {
+        DemoUtils.banner("CONSOLIDATED: Bad SQL Patterns to Avoid in CockroachDB");
+        System.out.println("""
+            This is the single-page reference of SQL anti-patterns that cause
+            production issues in CockroachDB. Each is demonstrated in the demos above.
+
+            ┌──────────────────────────────────────────────────────────────────────────┐
+            │  BAD SQL PATTERN                        │  WHY IT'S BAD       │  DEMO    │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  SAVEPOINT + ROLLBACK TO SAVEPOINT      │  40001 aborts entire│  Demo 1  │
+            │  as retry mechanism                     │  txn, not fixable   │          │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Read-modify-write on hot rows           │  40001 retries,     │  Demo 2 │
+            │  without retry logic                     │  lost updates       │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  SELECT large JSON + UPDATE in same txn  │  Long txn duration, │  Demo 3 │
+            │                                          │  idle time, 40001   │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Row-by-row INSERT/UPDATE in a loop      │  N round trips,     │  Demo 4 │
+            │  (N+1 pattern)                           │  ~50%% idle time    │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  SELECT * without WHERE or LIMIT         │  Full table scan,   │  Demo 5 │
+            │  inside a transaction                    │  blocks other txns  │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  UPDATE without WHERE clause             │  Bulk write, can    │  Demo 5 │
+            │                                          │  exceed row limits  │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  20+ statements in one transaction       │  Accumulates toward │  Demo 6 │
+            │  (each writing KB-sized payloads)        │  16MB txn limit     │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Storing multi-MB JSON blobs inline      │  Slow Raft, range   │  Demo 6 │
+            │                                          │  split backpressure │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  SERIAL/SEQUENCE primary keys            │  Write hotspot on   │  Demo 7 │
+            │                                          │  one node, CPU skew │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Missing STORING clause on indexes       │  Index join penalty │  Demo 8 │
+            │  that return non-key columns             │  (extra round trip) │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Full-table scan on JSONB columns        │  No GIN index =     │  Demo 8 │
+            │  without inverted index                  │  scan every row     │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Multiple DDL in BEGIN/COMMIT            │  Not atomic in CRDB │  Demo 9 │
+            │                                          │  partial commit risk│         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  SELECT * in prepared statements         │  Schema change      │  Demo 9 │
+            │                                          │  breaks cached plan │         │
+            ├──────────────────────────────────────────────────────────────────────────┤
+            │  Mixing reads, writes, and DDL in        │  Long duration,     │  Demo 9 │
+            │  one logical transaction                 │  contention, errors │         │
+            └──────────────────────────────────────────────────────────────────────────┘
+
+            GENERAL RULES:
+              1. Keep transactions SHORT: <10 statements, <4 MB total payload
+              2. Keep rows SMALL: <1 MB per row, use chunking or object storage
+              3. Use UUID primary keys (gen_random_uuid()), never SERIAL
+              4. Add STORING clause to indexes that serve SELECT queries
+              5. Use AS OF SYSTEM TIME for read-heavy operations outside write txns
+              6. Use addBatch/executeBatch instead of row-by-row loops
+              7. One DDL per implicit transaction (no BEGIN/COMMIT wrapping)
+              8. Always list explicit columns in prepared statements (no SELECT *)
+              9. Set session guardrails (transaction_rows_read/written_err) in dev/test
+             10. Monitor SHOW JOBS for schema change progress
+        """);
     }
 }

@@ -271,6 +271,38 @@ public class Demo7_PrimaryKeyAntiPatterns {
         System.out.printf("  Hash-sharded:           %,5d ms  (8 buckets for sequential keys)%n", hashMs);
         System.out.printf("  Composite PK:           %,5d ms  (distributed by region prefix)%n", compositeMs);
 
+        // -----------------------------------------------------------------
+        // WHY one DB node has elevated CPU
+        // -----------------------------------------------------------------
+        DemoUtils.section("WHY SERIAL PKs cause elevated CPU on ONE node");
+
+        System.out.println("""
+            A common observation in production: one CockroachDB node shows 80-90%%
+            CPU utilization while the other nodes are idle at 10-20%%. This is almost
+            always caused by a write hotspot from sequential primary keys.
+
+            Here's the chain:
+
+            1. SERIAL/SEQUENCE PKs generate monotonically increasing values
+            2. All new rows have keys LARGER than existing rows
+            3. CockroachDB sorts data by primary key into RANGES
+            4. All new inserts land in the LAST range (the one with the highest keys)
+            5. That range lives on ONE specific node (the leaseholder)
+            6. That ONE node handles ALL inserts -> elevated CPU
+
+            Meanwhile, other nodes are idle because no writes are routed to them.
+            The cluster has 5 nodes but only 1 is doing work -- you're paying for
+            5x the hardware but getting 1x the throughput.
+
+            Diagnosis in DB Console:
+              - Hot Ranges page: one range receiving all QPS
+              - Hardware dashboard: CPU skew across nodes
+              - SQL Activity: all writes hitting same range_id
+
+            Fix: Switch to UUID with gen_random_uuid() and the writes will distribute
+            evenly across ALL nodes. CPU utilization becomes uniform.
+        """);
+
         System.out.println("""
 
             TAKEAWAY: Coming from PostgreSQL/Oracle, STOP using SERIAL or SEQUENCE

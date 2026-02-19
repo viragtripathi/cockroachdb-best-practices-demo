@@ -9,14 +9,17 @@ import java.util.UUID;
 /**
  * DEMO 6: Large Payload Anti-Pattern and Chunking
  * <p>
- * Addresses the practical ~16MB row/transaction payload limit.
+ * Addresses the practical ~16MB row AND transaction payload limit.
  * <p>
- * Scenario: A bank stores customer onboarding packets -- these include scanned
- * documents, signed agreements, and extensive KYC data as JSON. Some packets
- * approach or exceed the practical 16MB row size limit.
+ * The 16MB limit is not just about single-row size. A transaction with 20+ SQL
+ * statements, each inserting/updating modest KB-sized rows, can accumulate a
+ * total transaction payload that hits the limit. This demo shows both scenarios.
+ * <p>
+ * Also explains "split failed while applying backpressure to Put" errors.
  * <p>
  * Shows:
- *   - Large inline payloads stress Raft replication and increase compaction CPU
+ *   - Single large row approaching limits
+ *   - Multi-statement transaction accumulating KB-sized rows toward 16MB
  *   - Chunking strategy: split payloads into smaller rows
  *   - Reference strategy: store payloads in object storage with a DB pointer
  *   - Hot field extraction: pull queried fields into indexed columns
@@ -27,12 +30,28 @@ public class Demo6_LargePayloadAntiPattern {
         DemoUtils.banner("DEMO 6: Large Payload Anti-Pattern & Chunking Strategy");
 
         System.out.println("""
-            CockroachDB has a practical limit of ~16MB per row/transaction payload.
-            Large rows stress Raft replication, increase compaction CPU, and can
-            trigger "split failed while applying backpressure" errors.
+            CockroachDB has a practical limit of ~16MB per row AND per transaction
+            payload. This limit applies to the TOTAL data written in a single
+            transaction, not just individual rows.
 
-            This is common in banking: KYC onboarding packets, signed PDFs stored
-            as base64, or large audit trail JSON can easily approach this limit.
+            Two ways to hit this limit:
+              1. ONE large row (e.g., a 15MB JSON document in a single INSERT)
+              2. MANY moderate rows in one transaction (e.g., 25 INSERTs of 500KB
+                 each = 12.5MB total, plus overhead = close to the limit)
+
+            When exceeded, you get errors like:
+              ERROR: split failed while applying backpressure to Put[/Table/...]
+
+            This error means a range has grown too large for CockroachDB to split
+            efficiently. The Raft replication pipeline stalls because:
+              - Each Raft proposal must fit in memory on every replica
+              - Large proposals slow down consensus and block other writes
+              - The range can't split while a large write is in flight
+              - Compaction (LSM merge) falls behind under sustained large writes
+
+            Banking systems hit this with: KYC onboarding packets, signed PDFs
+            stored as base64, audit trail JSON, or batch settlement transactions
+            that write hundreds of rows per commit.
         """);
 
         // Seed an account
@@ -54,13 +73,132 @@ public class Demo6_LargePayloadAntiPattern {
 
         RetryableExecutor executor = new RetryableExecutor();
 
-        // Build a ~2MB JSON payload simulating a large onboarding packet
-        // (We use 2MB instead of 16MB to keep the demo fast on local instances)
+        // -----------------------------------------------------------------
+        // SCENARIO 1: Multi-statement transaction accumulating toward 16MB
+        // -----------------------------------------------------------------
+        DemoUtils.section("SCENARIO 1: Multi-statement transaction accumulating KB-sized rows");
+        System.out.println("""
+            Real banking transactions often have 20-30+ SQL statements:
+              - INSERT audit log entry (~50 KB JSON each)
+              - UPDATE account balances
+              - INSERT payment records with metadata
+              - INSERT compliance check results
+
+            Each statement writes a modest amount, but the TOTAL transaction payload
+            is the sum of ALL writes. Here's the math:
+
+              25 statements x 500 KB each = 12.5 MB total transaction payload
+              30 statements x 600 KB each = 18 MB -- EXCEEDS THE LIMIT
+
+            This is the scenario most teams miss: no single row is large, but the
+            transaction as a whole is too big.
+        """);
+
+        // Demonstrate accumulation with KB-sized inserts
+        int stmtCount = 25;
+        int perStmtKB = 50;  // 50 KB per statement (realistic audit log size)
+        String filler = "X".repeat(perStmtKB * 1024);
+
+        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("DROP TABLE IF EXISTS demo6_audit_log CASCADE");
+            stmt.execute("""
+                CREATE TABLE demo6_audit_log (
+                    log_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    txn_ref STRING NOT NULL,
+                    action STRING NOT NULL,
+                    details STRING NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """);
+        }
+
+        long accumulatedKB = 0;
+        long multiStmtStart = System.currentTimeMillis();
+        executor.executeVoid(() -> {
+            try (Connection conn = ds.getConnection()) {
+                conn.setAutoCommit(false);
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO demo6_audit_log (txn_ref, action, details) VALUES (?, ?, ?)")) {
+                    for (int i = 1; i <= stmtCount; i++) {
+                        ps.setString(1, "TXN-2024-" + i);
+                        ps.setString(2, "SETTLEMENT_STEP_" + i);
+                        ps.setString(3, filler);
+                        ps.executeUpdate();
+                    }
+                }
+                conn.commit();
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        });
+        long multiStmtMs = System.currentTimeMillis() - multiStmtStart;
+        accumulatedKB = (long) stmtCount * perStmtKB;
+
+        DemoUtils.log(stmtCount + " statements x " + perStmtKB + " KB each = " +
+                String.format("%,d", accumulatedKB) + " KB total transaction payload");
+        DemoUtils.log("Completed in " + multiStmtMs + "ms");
+        DemoUtils.log("At this size it works, but scale it up:");
+        System.out.println("""
+
+            Transaction size projections:
+              25 stmts x  50 KB =  1,250 KB (  1.2 MB) -- OK
+              25 stmts x 200 KB =  5,000 KB (  4.9 MB) -- OK but slow Raft
+              25 stmts x 500 KB = 12,500 KB ( 12.2 MB) -- DANGER ZONE
+              30 stmts x 600 KB = 18,000 KB ( 17.6 MB) -- EXCEEDS 16MB LIMIT
+              40 stmts x 500 KB = 20,000 KB ( 19.5 MB) -- EXCEEDS 16MB LIMIT
+
+            FIX: Break multi-statement transactions into smaller batches:
+              - Commit every 5-10 statements instead of 25-30
+              - Use separate transactions for audit logs vs balance updates
+              - Move large payloads (JSON blobs, base64 docs) to separate writes
+        """);
+
+        // Show the batched approach
+        DemoUtils.section("FIX: Break into smaller transaction batches");
+
+        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("DELETE FROM demo6_audit_log WHERE true");
+        }
+
+        int batchSize = 5;
+        long batchedStart = System.currentTimeMillis();
+        for (int batch = 0; batch < stmtCount / batchSize; batch++) {
+            final int batchNum = batch;
+            executor.executeVoid(() -> {
+                try (Connection conn = ds.getConnection()) {
+                    conn.setAutoCommit(false);
+                    try (PreparedStatement ps = conn.prepareStatement(
+                            "INSERT INTO demo6_audit_log (txn_ref, action, details) VALUES (?, ?, ?)")) {
+                        for (int i = 1; i <= batchSize; i++) {
+                            int stmtIdx = batchNum * batchSize + i;
+                            ps.setString(1, "TXN-2024-" + stmtIdx);
+                            ps.setString(2, "SETTLEMENT_STEP_" + stmtIdx);
+                            ps.setString(3, filler);
+                            ps.executeUpdate();
+                        }
+                    }
+                    conn.commit();
+                } catch (SQLException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+        long batchedMs = System.currentTimeMillis() - batchedStart;
+        DemoUtils.log("Batched: " + stmtCount + " statements in " + (stmtCount / batchSize) +
+                " batches of " + batchSize + " = " + batchedMs + "ms");
+        DemoUtils.log("Each batch: " + (batchSize * perStmtKB) + " KB (well under 16MB limit)");
+
+        // -----------------------------------------------------------------
+        // SCENARIO 2: Single large row
+        // -----------------------------------------------------------------
+        DemoUtils.section("SCENARIO 2: Single large row approaching the limit");
+
+        // Build a ~500KB JSON payload (realistic KYC packet)
         StringBuilder json = new StringBuilder();
         json.append("{\"customer_id\": \"").append(accountId).append("\", ");
         json.append("\"doc_type\": \"ONBOARDING_PACKET\", ");
         json.append("\"sections\": [");
-        int sectionCount = 2000;
+        int sectionCount = 500;
         for (int i = 0; i < sectionCount; i++) {
             if (i > 0) json.append(",");
             json.append("{\"section\": \"").append(i).append("\", ");
@@ -69,20 +207,19 @@ public class Demo6_LargePayloadAntiPattern {
             json.append("\"verified\": ").append(i % 3 == 0).append("}");
         }
         json.append("]}");
-        int payloadBytes = json.length();
-        DemoUtils.log("Built onboarding packet: " + String.format("%,.0f", (double) payloadBytes / 1024) + " KB");
+        int payloadKB = json.length() / 1024;
+        DemoUtils.log("Built onboarding packet: " + String.format("%,d", payloadKB) + " KB");
 
-        // -----------------------------------------------------------------
-        // ANTI-PATTERN: Store the entire payload in one row
-        // -----------------------------------------------------------------
-        DemoUtils.section("ANTI-PATTERN: Store entire " + String.format("%,.0f", (double) payloadBytes / 1024) + " KB payload in one row");
         System.out.println("""
-            Storing a multi-MB JSON document as a single JSONB row works for small
-            payloads, but at scale this causes:
-              - Slow Raft replication (entire payload replicated on every write)
-              - High compaction CPU
-              - Range split backpressure under load
-              - Increased 40001 retry probability (larger txn = more conflict window)
+            Even a single 500KB row causes overhead:
+              - Raft replicates the ENTIRE row to all replicas on every write
+              - Updating one field in the JSON rewrites the whole row
+              - Multiple such rows in one transaction compound the problem
+
+            At 16MB you get hard failures. But even at 1-5MB, performance degrades:
+              - Raft proposals take longer to replicate
+              - Range splits are blocked during large writes
+              - Compaction CPU increases (larger SSTable entries to merge)
         """);
 
         long inlineStart = System.currentTimeMillis();
@@ -103,8 +240,7 @@ public class Demo6_LargePayloadAntiPattern {
                 }
             });
             long inlineMs = System.currentTimeMillis() - inlineStart;
-            DemoUtils.log("Inline insert took " + inlineMs + "ms");
-            DemoUtils.log("This works at 2MB but degrades badly approaching 16MB");
+            DemoUtils.log("Inline insert of " + payloadKB + " KB took " + inlineMs + "ms");
         } catch (Exception e) {
             DemoUtils.log("Inline insert FAILED: " + e.getMessage());
         }
@@ -112,17 +248,18 @@ public class Demo6_LargePayloadAntiPattern {
         // -----------------------------------------------------------------
         // CORRECT STRATEGY 1: Chunked storage
         // -----------------------------------------------------------------
-        DemoUtils.section("CORRECT STRATEGY 1: Chunk payload into smaller rows");
+        DemoUtils.section("FIX STRATEGY 1: Chunk large payloads into smaller rows");
         System.out.println("""
             Split the large document into fixed-size chunks stored as separate rows.
             Each chunk is well under the limit. Reassemble on read by ordering chunks.
+
+            Recommended chunk size: 64-256 KB (well under range split threshold).
         """);
 
-        int chunkSize = 256 * 1024; // 256 KB per chunk
+        int chunkSize = 64 * 1024; // 64 KB per chunk
         String rawPayload = json.toString();
         int numChunks = (int) Math.ceil((double) rawPayload.length() / chunkSize);
 
-        // First, create a document record (small, just metadata)
         String chunkedDocId;
         try (Connection conn = ds.getConnection();
              PreparedStatement ps = conn.prepareStatement(
@@ -157,7 +294,7 @@ public class Demo6_LargePayloadAntiPattern {
             }
         });
         long chunkMs = System.currentTimeMillis() - chunkStart;
-        DemoUtils.log("Chunked insert: " + numChunks + " chunks in " + chunkMs + "ms");
+        DemoUtils.log("Chunked insert: " + numChunks + " chunks of 64 KB in " + chunkMs + "ms");
 
         // Verify reassembly
         StringBuilder reassembled = new StringBuilder();
@@ -171,55 +308,89 @@ public class Demo6_LargePayloadAntiPattern {
                 }
             }
         }
-        DemoUtils.log("Reassembled: " + String.format("%,.0f", (double) reassembled.length() / 1024) +
+        DemoUtils.log("Reassembled: " + String.format("%,d", reassembled.length() / 1024) +
                 " KB (matches original: " + rawPayload.contentEquals(reassembled) + ")");
 
         // -----------------------------------------------------------------
         // CORRECT STRATEGY 2: External storage reference
         // -----------------------------------------------------------------
-        DemoUtils.section("CORRECT STRATEGY 2: Store in object storage, keep DB reference");
+        DemoUtils.section("FIX STRATEGY 2: Store in object storage, keep DB reference");
         System.out.println("""
-            For very large documents (10MB+), store the actual content in object
-            storage (S3, GCS, Azure Blob) and keep only a reference in the database:
+            For documents over ~1MB, store the content in object storage (S3, GCS,
+            Azure Blob) and keep only a reference in the database:
 
               INSERT INTO customer_documents (doc_id, account_id, doc_type, payload, status)
               VALUES (gen_random_uuid(), '...', 'ONBOARDING',
                       '{"storage": "s3", "bucket": "bank-docs", "key": "onboarding/12345.json"}'::JSONB,
                       'PENDING_REVIEW');
 
-            The database row stays tiny. The app fetches the actual content from
-            object storage when needed.
+            The database row stays tiny (<1 KB). The app fetches the actual content
+            from object storage when needed. This completely eliminates the 16MB concern.
         """);
 
         // -----------------------------------------------------------------
         // CORRECT STRATEGY 3: Extract hot fields
         // -----------------------------------------------------------------
-        DemoUtils.section("CORRECT STRATEGY 3: Extract hot JSON fields into indexed columns");
+        DemoUtils.section("FIX STRATEGY 3: Extract hot JSON fields into indexed columns");
         System.out.println("""
-            If queries frequently filter on JSON fields (e.g., "find all KYC docs
-            for customer X" or "find all docs with risk_score > 50"), extract those
-            fields into typed columns with B-tree indexes:
+            If queries frequently filter on JSON fields, extract them into typed
+            columns with B-tree indexes:
 
               ALTER TABLE customer_documents ADD COLUMN customer_id_indexed UUID;
               CREATE INDEX idx_docs_customer ON customer_documents (customer_id_indexed);
 
-            Or add an inverted index on the JSONB column for flexible queries:
+            Or add an inverted index on the JSONB column:
 
               CREATE INVERTED INDEX idx_docs_payload ON customer_documents (payload);
 
-            This converts expensive full-table JSON scans into fast index lookups,
-            dramatically reducing transaction duration and retry probability.
+            This converts expensive full-table JSON scans into fast index lookups.
+        """);
+
+        // -----------------------------------------------------------------
+        // "split failed while applying backpressure" deep dive
+        // -----------------------------------------------------------------
+        DemoUtils.section("DEEP DIVE: 'split failed while applying backpressure to Put'");
+        System.out.println("""
+            This error occurs when CockroachDB cannot split a range fast enough to
+            accommodate incoming writes. Here's the chain of events:
+
+            1. Data in CockroachDB is divided into RANGES (default ~512 MB each)
+            2. When a range grows too large, CockroachDB splits it into two ranges
+            3. During a split, the range must pause writes momentarily
+            4. If writes are too large or too fast, splits can't keep up
+            5. The system applies BACKPRESSURE -- slowing or rejecting writes
+
+            Common causes:
+              - Large row values (multi-MB JSON, base64 blobs)
+              - High write throughput to a narrow key range (hotspot)
+              - Many large rows written in a single transaction
+              - Sequential primary keys concentrating all writes in one range
+
+            Solutions:
+              1. Keep individual row sizes under 1 MB
+              2. Keep total transaction payload well under 16 MB
+              3. Break large transactions into smaller commits (5-10 statements)
+              4. Use UUID primary keys to distribute writes across ranges
+              5. Move large blobs to object storage (S3/GCS)
+              6. Use hash-sharded indexes for sequential write patterns
         """);
 
         System.out.println("""
-            TAKEAWAY: Keep row sizes well under 16MB. For large payloads:
-              1. Chunk into multiple rows (shown above)
-              2. Store in object storage with a DB reference
-              3. Extract frequently-queried JSON fields into indexed columns
+            SUMMARY: The 16MB limit applies to TOTAL transaction payload, not just
+            individual rows. A transaction with 20-30 modest SQL statements can hit
+            it. Audit your transaction patterns:
 
-            Audit which documents exceed 1MB and apply one of these strategies.
-            Add inverted indexes on JSONB columns used in WHERE clauses to
-            eliminate full-table scans inside transactions.
+              1. Count statements per transaction (target: <10)
+              2. Measure total payload per transaction (target: <4 MB)
+              3. Keep individual row sizes under 1 MB
+              4. Chunk large documents into 64-256 KB pieces
+              5. Store blobs >1 MB in object storage with DB references
+              6. Separate audit/logging writes from business logic transactions
         """);
+
+        // Cleanup
+        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("DROP TABLE IF EXISTS demo6_audit_log CASCADE");
+        }
     }
 }
